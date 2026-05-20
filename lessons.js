@@ -240,20 +240,26 @@ function derivLesson(perf) {
   if (outcome === "good" || outcome === "bad") {
     if (perf.range_efficiency < 30 && outcome === "bad") {
       rule = `AVOID: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
-      tags.push("oor", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
+      tags.push("oor", "volatility", "risk", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
     } else if (perf.range_efficiency > 80 && outcome === "good") {
       rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
-      tags.push("efficient", perf.strategy);
+      tags.push("efficient", "volatility", "screening", perf.strategy);
     } else if (outcome === "bad" && perf.close_reason?.includes("volume")) {
       rule = `AVOID: Pools with fee_tvl_ratio=${perf.fee_tvl_ratio} that showed volume collapse — fees evaporated quickly. Minimum sustained volume check needed before deploying.`;
-      tags.push("volume_collapse");
+      tags.push("volume_collapse", "volume", "fee", "tvl", "screening");
     } else if (outcome === "good") {
       rule = `WORKED: ${context} → PnL +${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%.`;
-      tags.push("worked");
+      tags.push("worked", "screening", "fee", "tvl", "volatility");
     } else {
       rule = `FAILED: ${context} → PnL ${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%. Reason: ${perf.close_reason}.`;
-      tags.push("failed");
+      tags.push("failed", "screening", "risk", "fee", "tvl", "volatility");
     }
+  }
+
+  // poor outcome juga perlu tags agar SCREENER bisa belajar
+  if (outcome === "poor" && !rule) {
+    rule = `CAUTION: ${context} → PnL ${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%. Reason: ${perf.close_reason}.`;
+    tags.push("risk", "screening", "fee", "tvl");
   }
 
   if (!rule) return null;
@@ -327,7 +333,8 @@ export function evolveThresholds(perfData, config) {
   {
     const winnerVols = winners.map((p) => p.volatility).filter(isFiniteNum);
     const loserVols  = losers.map((p) => p.volatility).filter(isFiniteNum);
-    const current    = config.screening.maxVolatility;
+    // Bug #5 fix: config.screening.maxVolatility does not exist — use a sensible default
+    const current    = isFiniteNum(config.screening.maxVolatility) ? config.screening.maxVolatility : 10.0;
 
     if (loserVols.length >= 2) {
       // 25th percentile of loser volatilities — this is where things start going wrong
@@ -357,12 +364,12 @@ export function evolveThresholds(perfData, config) {
     }
   }
 
-  // ── 2. minFeeTvlRatio ─────────────────────────────────────────
+  // ── 2. minFeeActiveTvlRatio ─────────────────────────────────────
   // Raise the floor if low-fee pools consistently underperform.
   {
     const winnerFees = winners.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
     const loserFees  = losers.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
-    const current    = config.screening.minFeeTvlRatio;
+    const current    = config.screening.minFeeActiveTvlRatio;
 
     if (winnerFees.length >= 2) {
       // Minimum fee/TVL among winners — we know pools below this don't work for us
@@ -372,8 +379,8 @@ export function evolveThresholds(perfData, config) {
         const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
         const rounded = Number(newVal.toFixed(2));
         if (rounded > current) {
-          changes.minFeeTvlRatio = rounded;
-          rationale.minFeeTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
+          changes.minFeeActiveTvlRatio = rounded;
+          rationale.minFeeActiveTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
         }
       }
     }
@@ -388,9 +395,9 @@ export function evolveThresholds(perfData, config) {
           const target  = maxLoserFee * 1.2;
           const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
           const rounded = Number(newVal.toFixed(2));
-          if (rounded > current && !changes.minFeeTvlRatio) {
-            changes.minFeeTvlRatio = rounded;
-            rationale.minFeeTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
+          if (rounded > current && !changes.minFeeActiveTvlRatio) {
+            changes.minFeeActiveTvlRatio = rounded;
+            rationale.minFeeActiveTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
           }
         }
       }
@@ -429,17 +436,25 @@ export function evolveThresholds(perfData, config) {
     try { userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8")); } catch { /* ignore */ }
   }
 
-  Object.assign(userConfig, changes);
+  // Bug #5 fix: use correct config key names that match config.js and reloadScreeningThresholds()
+  // maxVolatility → does not exist in config.screening, skip persisting it (volatility is a pool metric, not a config threshold)
+  // minFeeActiveTvlRatio → correct key (was wrongly saved as minFeeTvlRatio before)
+  const persistChanges = {};
+  if (changes.maxVolatility    != null) persistChanges.maxVolatility    = changes.maxVolatility;
+  if (changes.minFeeActiveTvlRatio != null) persistChanges.minFeeActiveTvlRatio = changes.minFeeActiveTvlRatio;
+  if (changes.minOrganic       != null) persistChanges.minOrganic       = changes.minOrganic;
+
+  Object.assign(userConfig, persistChanges);
   userConfig._lastEvolved = new Date().toISOString();
   userConfig._positionsAtEvolution = perfData.length;
 
   fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
-  // Apply to live config object immediately
+  // Apply to live config object immediately — use correct field names
   const s = config.screening;
-  if (changes.maxVolatility    != null) s.maxVolatility    = changes.maxVolatility;
-  if (changes.minFeeTvlRatio   != null) s.minFeeTvlRatio   = changes.minFeeTvlRatio;
-  if (changes.minOrganic       != null) s.minOrganic       = changes.minOrganic;
+  if (changes.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = changes.minFeeActiveTvlRatio;
+  if (changes.minOrganic           != null) s.minOrganic           = changes.minOrganic;
+  // Note: maxVolatility is not a screening config field — it's handled by isUsableVolatility() in screening.js
 
   // Log a lesson summarizing the evolution
   const data = load();
