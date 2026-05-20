@@ -604,8 +604,8 @@ export function clearPerformance() {
 
 // Tags that map to each agent role — used for role-aware lesson injection
 const ROLE_TAGS = {
-  SCREENER: ["screening", "narrative", "strategy", "deployment", "token", "volume", "entry", "bundler", "holders", "organic"],
-  MANAGER:  ["management", "risk", "oor", "fees", "position", "hold", "close", "pnl", "rebalance", "claim"],
+  SCREENER: ["screening", "narrative", "strategy", "deployment", "token", "volume", "entry", "bundler", "holders", "organic", "evolution", "config_change", "fee", "tvl", "volatility", "killer", "oor", "risk"],
+  MANAGER:  ["management", "risk", "oor", "fees", "position", "hold", "close", "pnl", "rebalance", "claim", "evolution", "config_change", "volatility"],
   GENERAL:  [], // all lessons
 };
 
@@ -629,11 +629,11 @@ export function getLessonsForPrompt(opts = {}) {
   const data = load();
   if (data.lessons.length === 0) return null;
 
-  // Smaller caps for automated cycles — they don't need the full lesson history
+  // Auto cycles get the same lesson access as GENERAL — they need full context to make good decisions
   const isAutoCycle = agentType === "SCREENER" || agentType === "MANAGER";
-  const PINNED_CAP  = isAutoCycle ? 5  : 10;
-  const ROLE_CAP    = isAutoCycle ? 6  : 15;
-  const RECENT_CAP  = maxLessons ?? (isAutoCycle ? 10 : 35);
+  const PINNED_CAP  = isAutoCycle ? 10 : 10;
+  const ROLE_CAP    = isAutoCycle ? 15 : 15;
+  const RECENT_CAP  = maxLessons ?? (isAutoCycle ? 35 : 35);
 
   const outcomePriority = { bad: 0, poor: 1, failed: 1, good: 2, worked: 2, manual: 1, neutral: 3, evolution: 2 };
   const byPriority = (a, b) => (outcomePriority[a.outcome] ?? 3) - (outcomePriority[b.outcome] ?? 3);
@@ -675,7 +675,7 @@ export function getLessonsForPrompt(opts = {}) {
   const selected = [...pinned, ...roleMatched, ...recent];
   const shared = getSharedLessonsForPrompt({
     agentType,
-    maxLessons: isAutoCycle ? 4 : 6,
+    maxLessons: isAutoCycle ? 6 : 6,
   });
   if (selected.length === 0 && !shared) return null;
 
