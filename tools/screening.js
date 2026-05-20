@@ -191,7 +191,14 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
   const volatilityTimeframe = getVolatilityTimeframe(sourceTimeframe);
   if (sourceTimeframe === volatilityTimeframe) {
     for (const pool of rawPools) {
-      if (pool) pool.volatility_timeframe = volatilityTimeframe;
+      if (pool) {
+        pool.volatility_timeframe = volatilityTimeframe;
+        // Bug #3 fix: volatility=0 from discord signals is NOT stable — it means missing data.
+        // Force to null so isUsableVolatility() rejects it correctly.
+        if (pool.volatility === 0 || pool.volatility === "0") {
+          pool.volatility = null;
+        }
+      }
     }
     return rawPools;
   }
@@ -208,13 +215,22 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
   for (const result of volatilityResults) {
     if (result.status !== "fulfilled") continue;
     if (result.value.volatility == null) continue;
+    // Bug #3 fix: volatility=0 is missing/unusable data, not "stable" — skip it
+    if (result.value.volatility === 0) continue;
     volatilityByPool.set(result.value.poolAddress, result.value.volatility);
   }
 
   for (const pool of rawPools) {
-    if (!pool?.pool_address || !volatilityByPool.has(pool.pool_address)) continue;
-    pool.volatility = volatilityByPool.get(pool.pool_address);
-    pool.volatility_timeframe = volatilityTimeframe;
+    if (!pool?.pool_address) continue;
+    if (volatilityByPool.has(pool.pool_address)) {
+      pool.volatility = volatilityByPool.get(pool.pool_address);
+      pool.volatility_timeframe = volatilityTimeframe;
+    } else if (pool.discord_signal) {
+      // Bug #3 fix: discord signal pools that failed volatility enrichment must be
+      // treated as unusable — force null so the filter rejects them explicitly
+      pool.volatility = null;
+      pool.volatility_timeframe = volatilityTimeframe;
+    }
   }
 
   return rawPools;
