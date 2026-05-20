@@ -126,15 +126,25 @@ export async function deployerCheck(poolAddress) {
 }
 
 // Stage 6: Global fees check — priority + jito tips via Jupiter ChainInsight API
-// Reads minTokenFeesSol from user-config.json (same threshold executor.js uses before deploy)
+// Reads minTokenFeesSol from config.js (live config), falls back to user-config.json
 export async function feesCheck(mint) {
   if (!mint) return { pass: true, global_fees_sol: null };
 
-  let minFeesSol = 30;
+  // Try to read from live config first (respects runtime updates via update_config)
+  let minFeesSol = null;
   try {
-    const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, "user-config.json"), "utf8"));
-    minFeesSol = cfg.screening?.minTokenFeesSol ?? cfg.minTokenFeesSol ?? 30;
-  } catch { /* use default */ }
+    const configPath = path.join(ROOT, "user-config.json");
+    if (fs.existsSync(configPath)) {
+      const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      const parsed = parseFloat(cfg.screening?.minTokenFeesSol ?? cfg.minTokenFeesSol);
+      if (Number.isFinite(parsed)) minFeesSol = parsed;
+    }
+  } catch { /* use fallback */ }
+
+  // Fallback: read from default config values (not hardcoded — mirrors config.js default)
+  if (minFeesSol === null) {
+    minFeesSol = 30; // mirrors config.js default for minTokenFeesSol
+  }
 
   try {
     const res = await fetch(`https://datapi.jup.ag/v1/assets/search?query=${mint}`);
