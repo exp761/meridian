@@ -412,7 +412,13 @@ export async function discoverPools({
       .filter(Boolean);
 
     if (config.screening.discordSignalMode === "only") {
-      rawPools = signalPools;
+      // Bug #6 fix: signal pools in "only" mode still need the same enrichment as merged pools.
+      // Ensure volatile=0 and missing fields are treated as null so filters work correctly.
+      rawPools = signalPools.map((pool) => ({
+        ...pool,
+        // Normalize volatility=0 to null — it means missing data, not stable
+        volatility: (pool.volatility === 0 || pool.volatility === "0") ? null : (pool.volatility ?? null),
+      }));
     } else if (signalPools.length > 0) {
       const byPool = new Map(rawPools.map((pool) => [pool.pool_address, pool]));
       for (const signalPool of signalPools) {
