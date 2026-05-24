@@ -7,6 +7,7 @@ import {
   getPositionPnl,
   claimFees,
   closePosition,
+  addLiquidity,
   searchPools,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
@@ -30,6 +31,7 @@ import { execSync, spawn } from "child_process";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
+const DATAPI_BASE = "https://datapi.jup.ag/v1";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
   "5m": 5,
@@ -80,6 +82,24 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
   if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
   const data = await res.json();
   return (data?.data || [])[0] ?? null;
+}
+
+/**
+ * Fetch global_fees_sol for a token mint directly from datapi.
+ * Independent of LLM — used as hard gate in validateDeployPoolThresholds.
+ */
+async function fetchTokenFeesSol(mint) {
+  try {
+    const url = `${DATAPI_BASE}/assets/search?query=${encodeURIComponent(mint)}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const token = (data?.data ?? data)?.[0];
+    if (!token) return null;
+    return token.fees != null ? parseFloat(Number(token.fees).toFixed(2)) : null;
+  } catch {
+    return null;
+  }
 }
 
 async function validateDeployPoolThresholds(args) {
@@ -164,6 +184,28 @@ async function validateDeployPoolThresholds(args) {
       pass: false,
       reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
     };
+  }
+
+  // ─── HARD GATE: minTokenFeesSol ──────────────────────────────
+  // Fetch fresh dari datapi — independen dari LLM, tidak bisa di-bypass.
+  const minTokenFeesSol = numberOrNull(config.screening.minTokenFeesSol);
+  if (minTokenFeesSol != null && minTokenFeesSol > 0) {
+    const baseMint = args.base_mint ?? detail?.token_x?.mint ?? detail?.base_mint ?? null;
+    if (!baseMint) {
+      return {
+        pass: false,
+        reason: `Cannot verify minTokenFeesSol: base_mint not provided in deploy args. Pass base_mint when calling deploy_position.`,
+      };
+    }
+    const feesSol = await fetchTokenFeesSol(baseMint);
+    if (feesSol === null) {
+      log("executor_warn", `Could not fetch global_fees_sol for ${baseMint} — skipping minTokenFeesSol gate`);
+    } else if (feesSol < minTokenFeesSol) {
+      return {
+        pass: false,
+        reason: `Token global_fees_sol ${feesSol} SOL is below hard gate minTokenFeesSol ${minTokenFeesSol} SOL. Deploy blocked — LLM cannot override this.`,
+      };
+    }
   }
 
   return { pass: true };
@@ -254,6 +296,7 @@ const toolMap = {
   check_smart_wallets_on_pool: checkSmartWalletsOnPool,
   claim_fees: claimFees,
   close_position: closePosition,
+  add_liquidity: addLiquidity,
   get_wallet_balance: getWalletBalances,
   swap_token: swapToken,
   get_top_lpers: studyTopLPers,
@@ -269,7 +312,6 @@ const toolMap = {
       if (result.includes("Already up to date")) {
         return { success: true, updated: false, message: "Already up to date — no restart needed." };
       }
-      // Delay restart so this tool response (and Telegram message) gets sent first
       setTimeout(() => {
         if (!process.env.pm_id) {
           const child = spawn(process.execPath, process.argv.slice(1), {
@@ -331,7 +373,6 @@ const toolMap = {
     return { error: "invalid mode" };
   },
   update_config: ({ changes, reason = "" }) => {
-    // Flat key → config section mapping (covers everything in config.js)
     const CONFIG_MAP = {
       // screening
       minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
@@ -352,6 +393,7 @@ const toolMap = {
       useDiscordSignals: ["screening", "useDiscordSignals"],
       discordSignalMode: ["screening", "discordSignalMode"],
       avoidPvpSymbols: ["screening", "avoidPvpSymbols"],
+      blockPvpSwmbols: ["screening", "blockPvpSymbols"],
       blockPvpSymbols: ["screening", "blockPvpSymbols"],
       maxBundlePct:     ["screening", "maxBundlePct"],
       maxBotHoldersPct: ["screening", "maxBotHoldersPct"],
@@ -432,7 +474,6 @@ const toolMap = {
     const applied = {};
     const unknown = [];
 
-    // Build case-insensitive lookup
     const CONFIG_MAP_LOWER = Object.fromEntries(
       Object.entries(CONFIG_MAP).map(([k, v]) => [k.toLowerCase(), [k, v]])
     );
@@ -476,7 +517,6 @@ const toolMap = {
       }
     }
 
-    // Apply to live config immediately after the persisted config is known-good.
     for (const [key, val] of Object.entries(applied)) {
       const [section, field] = CONFIG_MAP[key];
       const before = config[section][field];
@@ -518,14 +558,12 @@ const toolMap = {
     userConfig._lastAgentTune = new Date().toISOString();
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
-    // Restart cron jobs if intervals changed
     const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null;
     if (intervalChanged && _cronRestarter) {
       _cronRestarter();
       log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
     }
 
-    // Skip repeated volatility-driven interval changes; they are operational tuning, not reusable lessons.
     const lessonsKeys = Object.keys(applied).filter(
       k => k !== "managementIntervalMin" && k !== "screeningIntervalMin"
     );
@@ -557,10 +595,8 @@ const PROTECTED_TOOLS = new Set([
 export async function executeTool(name, args) {
   const startTime = Date.now();
 
-  // Strip model artifacts like "<|channel|>commentary" appended to tool names
   name = name.replace(/<.*$/, "").trim();
 
-  // ─── Validate tool exists ─────────────────
   const fn = toolMap[name];
   if (!fn) {
     const error = `Unknown tool: ${name}`;
@@ -568,7 +604,6 @@ export async function executeTool(name, args) {
     return { error };
   }
 
-  // ─── Pre-execution safety checks ──────────
   if (PROTECTED_TOOLS.has(name)) {
     const safetyCheck = await runSafetyChecks(name, args);
     if (!safetyCheck.pass) {
@@ -580,7 +615,6 @@ export async function executeTool(name, args) {
     }
   }
 
-  // ─── Execute ──────────────────────────────
   try {
     const result = await fn(args);
     const duration = Date.now() - startTime;
@@ -601,12 +635,10 @@ export async function executeTool(name, args) {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
         notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
-        // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
-        // Auto-swap base token back to SOL unless user said to hold
         if (!args.skip_swap && result.base_mint) {
           try {
             const balances = await getWalletBalances({});
@@ -614,7 +646,6 @@ export async function executeTool(name, args) {
             if (token && token.usd >= 0.10) {
               log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
               const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
-              // Tell the model the swap already happened so it doesn't call swap_token again
               result.auto_swapped = true;
               result.auto_swap_note = `Base token already auto-swapped back to SOL (${token.symbol || result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
               if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
@@ -649,7 +680,6 @@ export async function executeTool(name, args) {
       success: false,
     });
 
-    // Return error to LLM so it can decide what to do
     return {
       error: error.message,
       tool: name,
@@ -666,7 +696,6 @@ async function runSafetyChecks(name, args) {
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
 
-      // Reject pools with bin_step out of configured range
       const minStep = config.screening.minBinStep;
       const maxStep = config.screening.maxBinStep;
       if (args.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
@@ -735,7 +764,6 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Check position count limit + duplicate pool guard — force fresh scan to avoid stale cache
       const positions = await getMyPositions({ force: true });
       if (positions.total_positions >= config.risk.maxPositions) {
         return {
@@ -753,7 +781,6 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Block same base token across different pools
       if (args.base_mint) {
         const alreadyHasMint = positions.positions.some(
           (p) => p.base_mint === args.base_mint
@@ -766,7 +793,6 @@ async function runSafetyChecks(name, args) {
         }
       }
 
-      // Check amount limits
       const amountY = deployAmountY;
       if (!Number.isFinite(amountY) || amountY <= 0) {
         return {
@@ -789,7 +815,6 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Check SOL balance
       if (process.env.DRY_RUN !== "true") {
         const balance = await getWalletBalances();
         const gasReserve = config.management.gasReserve;
@@ -806,8 +831,6 @@ async function runSafetyChecks(name, args) {
     }
 
     case "swap_token": {
-      // Basic check — prevent swapping when DRY_RUN is true
-      // (handled inside swapToken itself, but belt-and-suspenders)
       return { pass: true };
     }
 
